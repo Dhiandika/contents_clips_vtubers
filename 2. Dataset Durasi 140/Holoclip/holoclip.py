@@ -1,17 +1,17 @@
 import os
 import csv
-import subprocess
+import yt_dlp
 from datetime import datetime, timedelta
 
 # Konfigurasi
-INPUT_CSV = "holoclip_data_filtered.csv"  # Nama file CSV baru
+INPUT_CSV = "holoclip_data_filtered.csv"
 OUTPUT_DIR = "downloaded_videos"
-VIDEOS_PER_DAY = 10  # Maksimal video per hari
-DEBUG_MODE = True  # Aktifkan debugging
-CHECKPOINT_FILE = "checkpoint.txt"  # File untuk menyimpan progress
-QUALITY_LOG_FILE = "quality_log.txt"  # File untuk menyimpan kualitas video yang diunduh
-DAYS_TO_DOWNLOAD = 7  # Ubah sesuai kebutuhan, misalnya 30 untuk sebulan
-PREFERRED_QUALITY = "1080p"  # Kualitas yang diinginkan (bisa diubah)
+VIDEOS_PER_DAY = 10
+DEBUG_MODE = True
+CHECKPOINT_FILE = "checkpoint.txt"
+QUALITY_LOG_FILE = "quality_log.txt"
+DAYS_TO_DOWNLOAD = 7
+PREFERRED_QUALITY = "1080p"
 
 # Daftar fallback kualitas jika yang dipilih tidak tersedia
 QUALITY_OPTIONS = ["1080p", "720p", "480p", "360p", "best"]
@@ -35,7 +35,7 @@ def read_csv(file_path):
             videos.append({
                 "id": video_id,
                 "title": row["title"],
-                "author_name": f"Youtube# {row['author']}"  # Tambahkan "Youtube#" di depan author
+                "author_name": f"Youtube: {row['author']}"  # Tambahkan "Youtube: " di depan author
             })
     return videos
 
@@ -62,49 +62,58 @@ def get_best_quality():
     quality_str = ",".join([f"bestvideo[height={q[:-1]}]+bestaudio/best" for q in QUALITY_OPTIONS])
     return quality_str
 
-def download_video(video_id, author, output_path):
-    """Mengunduh video dari YouTube menggunakan yt-dlp dengan kualitas yang bisa dipilih."""
+def download_video(video_id, author, output_path, video_number):
+    """Mengunduh video dari YouTube menggunakan yt-dlp dengan penomoran urut."""
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    filename = f"{video_number} {author} - {video_id}.mp4".replace("/", "_").replace("\\", "_")
+    filepath = os.path.join(output_path, filename)
+
+    if os.path.exists(filepath):
+        print(f"[SKIP] Video {filename} sudah ada.")
+        return filepath
+
+    log_debug(f"Mengunduh: {url} dengan kualitas {PREFERRED_QUALITY}")
+
+    ydl_opts = {
+        "format": get_best_quality(),
+        "outtmpl": filepath,
+        "noplaylist": True,
+        "quiet": not DEBUG_MODE,
+        "continuedl": True,  # Resume jika gagal
+        "merge_output_format": "mp4",
+        "progress_hooks": [lambda d: log_debug(f"Status: {d['status']}")] if DEBUG_MODE else None,
+    }
+
     try:
-        url = f"https://www.youtube.com/watch?v={video_id}"
-        filename = f"{author} - {video_id}.mp4".replace("/", "_").replace("\\", "_")  # Hindari karakter ilegal
-        filepath = os.path.join(output_path, filename)
-
-        if os.path.exists(filepath):
-            print(f"[SKIP] Video {filename} sudah ada.")
-            return filepath
-
-        log_debug(f"Mengunduh: {url} dengan kualitas {PREFERRED_QUALITY}")
-        command = [
-            "yt-dlp", "-f", get_best_quality(), "-o", filepath, url
-        ]
-        result = subprocess.run(command, capture_output=True, text=True)
-
-        if result.returncode == 0:
-            log_debug(f"Berhasil mengunduh {filename}")
-            save_checkpoint(video_id)
-            save_quality_log(video_id, PREFERRED_QUALITY)  # Simpan kualitas yang digunakan
-            return filepath
-        else:
-            error_message = result.stderr.lower()
-            if "private" in error_message or "unavailable" in error_message:
-                print(f"[SKIP] Video {video_id} tidak tersedia atau private.")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            result = ydl.download([url])
+            if result == 0:
+                log_debug(f"Berhasil mengunduh {filename}")
+                save_checkpoint(video_id)
+                save_quality_log(video_id, PREFERRED_QUALITY)
+                return filepath
             else:
-                print(f"[ERROR] Gagal mengunduh {video_id}: {result.stderr}")
-            return None
+                print(f"[ERROR] Gagal mengunduh {video_id}")
+                return None
 
-    except Exception as e:
-        print(f"[ERROR] Gagal mengunduh {video_id}: {e}")
+    except yt_dlp.DownloadError as e:
+        error_message = str(e).lower()
+        if "private" in error_message or "unavailable" in error_message or "403" in error_message:
+            print(f"[SKIP] Video {video_id} tidak tersedia atau private.")
+        else:
+            print(f"[ERROR] Gagal mengunduh {video_id}: {e}")
         return None
 
 def save_csv(data, output_file):
-    """Menyimpan data ke dalam file CSV dengan format yang diinginkan."""
+    """Menyimpan data ke dalam file CSV dengan format yang diinginkan dan menjaga urutan."""
     if not data:
         return
     keys = ["id", "title", "author_name"]
     with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
         writer = csv.DictWriter(csvfile, fieldnames=keys)
         writer.writeheader()
-        writer.writerows(data)
+        for row in data:  # Pastikan data ditulis sesuai urutan pengunduhan
+            writer.writerow(row)
 
 def format_date_folder(date):
     """Mengembalikan nama folder dalam format 'DD-MMMM'."""
@@ -122,22 +131,21 @@ def distribute_videos(videos):
         folder_path = os.path.join(OUTPUT_DIR, date_folder)
         os.makedirs(folder_path, exist_ok=True)
 
-        processed_videos = []
+        processed_videos = []  # List untuk menyimpan video yang telah berhasil diunduh
+        video_number = 1  # Mulai penomoran dari 1 untuk setiap folder baru
+
         for video in video_batches[i]:
             video_id = video['id']
-            author = video['author_name']
+            author = video['author_name'].replace("Youtube: ", "")  # Hilangkan 'Youtube: ' dari nama file
 
             if video_id in completed_videos:
                 print(f"[SKIP] Video {video_id} sudah diunduh sebelumnya.")
                 continue
 
-            filepath = download_video(video_id, author, folder_path)
+            filepath = download_video(video_id, author, folder_path, video_number)
             if filepath:
-                processed_videos.append({
-                    "id": video["id"],
-                    "title": video["title"],
-                    "author_name": video["author_name"]
-                })
+                processed_videos.append(video)  # Tambahkan ke daftar dalam urutan unduhan
+                video_number += 1  # Naikkan nomor untuk video berikutnya
 
         if processed_videos:
             csv_output = os.path.join(folder_path, "videos.csv")
